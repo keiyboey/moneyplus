@@ -286,10 +286,16 @@ def send_telegram_request(text, kind, record_id, chat_id=None):
     except Exception:
         pass
 
+_recent_tg_msgs = {}
 def send_telegram_simple(text, chat_id=None, reply_markup=None):
     target_chat = chat_id or get_admin_chat_id_standalone()
     if not TELEGRAM_BOT_TOKEN or not target_chat:
         return
+    key = (str(target_chat), str(text))
+    now = time.time()
+    if now - _recent_tg_msgs.get(key, 0) < 2.0:
+        return
+    _recent_tg_msgs[key] = now
     payload = {"chat_id": target_chat, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
