@@ -1,3 +1,4 @@
+import atexit
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(BASE_DIR, "instance", "money_plus_one.db")
 BACKUP_DIR = os.path.join(BASE_DIR, "instance", "backups")
 POLLER_PID_FILE = os.path.join(BASE_DIR, "instance", "telegram_poller.pid")
+POLLER_LOCK_FILE = os.path.join(BASE_DIR, "instance", "telegram_poller.lock")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("MPO_SECRET_KEY") or "CHANGE-THIS-SECRET-KEY-BEFORE-DEPLOYMENT"
@@ -862,6 +864,14 @@ def register():
                         "success"
                     )
                     db.commit()
+                    send_telegram_simple(
+                        f"🆕 NEW USER REGISTERED\n"
+                        f"ID: #{new_id}\n"
+                        f"Name: {name}\n"
+                        f"Email: {email_val}\n"
+                        f"Phone: {phone_val or '-'}\n"
+                        f"Ref Code: {code}"
+                    )
                     session.clear()
                     session["user_id"] = new_id
                     session.permanent = True
@@ -1650,34 +1660,38 @@ def admin_update_settings():
     db.commit()
     return redirect(url_for("admin_dashboard"))
 
-def _is_pid_running(pid):
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
+_poller_lock_fh = None
+
+def _release_poller_lock():
+    global _poller_lock_fh
+    if _poller_lock_fh:
+        try:
+            if os.name != "nt":
+                import fcntl
+                fcntl.flock(_poller_lock_fh.fileno(), fcntl.LOCK_UN)
+            _poller_lock_fh.close()
+        except Exception:
+            pass
+        _poller_lock_fh = None
 
 def start_single_telegram_poller():
-    if not TELEGRAM_BOT_TOKEN:
+    global _poller_lock_fh
+    if not TELEGRAM_BOT_TOKEN or _poller_lock_fh is not None:
         return
     if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         return
-    if os.path.exists(POLLER_PID_FILE):
-        try:
-            with open(POLLER_PID_FILE, "r", encoding="utf-8") as f:
-                raw_pid = f.read().strip()
-            if raw_pid.isdigit() and int(raw_pid) != os.getpid() and _is_pid_running(int(raw_pid)):
-                return
-        except Exception:
-            pass
-    threading.Thread(target=poll_telegram_bot, daemon=True).start()
+    fh = open(POLLER_LOCK_FILE, "a+")
+    try:
+        if os.name != "nt":
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _poller_lock_fh = fh
+        atexit.register(_release_poller_lock)
+        threading.Thread(target=poll_telegram_bot, daemon=True).start()
+    except OSError:
+        fh.close()
+
+start_single_telegram_poller()
 
 if __name__ == "__main__":
-    start_single_telegram_poller()
     app.run(host="0.0.0.0", port=5000, debug=True)
