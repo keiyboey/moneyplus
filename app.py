@@ -1306,6 +1306,7 @@ def apply_admin_decision(record_type, record_id, action, reason=None):
 def poll_telegram_bot():
     if not TELEGRAM_BOT_TOKEN:
         return
+    seen_updates = set()
     try:
         with open(POLLER_PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
@@ -1331,7 +1332,14 @@ def poll_telegram_bot():
             resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params, timeout=30).json()
             if resp.get("ok"):
                 for upd in resp.get("result", []):
-                    offset = upd["update_id"] + 1
+                    uid_upd = upd.get("update_id")
+                    if uid_upd is not None:
+                        offset = uid_upd + 1
+                        if uid_upd in seen_updates:
+                            continue
+                        seen_updates.add(uid_upd)
+                        if len(seen_updates) > 2000:
+                            seen_updates.clear()
                     msg = upd.get("message")
                     if msg and msg.get("text"):
                         chat_id = msg["chat"]["id"]
