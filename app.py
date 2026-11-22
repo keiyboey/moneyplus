@@ -2,6 +2,7 @@ import atexit
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import secrets
 import threading
@@ -14,10 +15,12 @@ from flask import Flask, render_template, request, redirect, url_for, session, f
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, "instance", "money_plus_one.db")
-BACKUP_DIR = os.path.join(BASE_DIR, "instance", "backups")
-POLLER_PID_FILE = os.path.join(BASE_DIR, "instance", "telegram_poller.pid")
-POLLER_LOCK_FILE = os.path.join(BASE_DIR, "instance", "telegram_poller.lock")
+VOLUME_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or (
+    "/app/instance" if os.path.isdir("/app/instance") else os.path.join(BASE_DIR, "instance")
+)
+DB_PATH = os.path.join(VOLUME_DIR, "money_plus_one.db")
+BACKUP_DIR = os.path.join(VOLUME_DIR, "backups")
+POLLER_PID_FILE = os.path.join(VOLUME_DIR, "telegram_poller.pid")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("MPO_SECRET_KEY") or "CHANGE-THIS-SECRET-KEY-BEFORE-DEPLOYMENT"
@@ -69,7 +72,7 @@ def normalize_identifier(raw_value):
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=15)
         g.db.row_factory = sqlite3.Row
     return g.db
 
@@ -80,7 +83,7 @@ def close_db(error=None):
         db.close()
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=15)
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,6 +218,21 @@ def init_db():
         db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
     db.execute("UPDATE settings SET value = '1500' WHERE key = 'min_withdrawal' AND value = '3000'")
+
+    admin_exists = db.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
+    admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
+    admin_raw = (os.environ.get("ADMIN_EMAIL") or os.environ.get("ADMIN_PHONE") or "").strip()
+    if not admin_exists and admin_raw and admin_pass:
+        kind, val = normalize_identifier(admin_raw)
+        adm_email = val if kind == "email" else f"admin_{val.lstrip('+')}@noemail.local"
+        adm_phone = "" if kind == "email" else val
+        db.execute(
+            """INSERT OR IGNORE INTO users
+               (full_name, email, phone_number, password_hash, role, account_status)
+               VALUES ('System Admin', ?, ?, ?, 'admin', 'active')""",
+            (adm_email, adm_phone, generate_password_hash(admin_pass))
+        )
+
     db.commit()
     db.close()
 
@@ -228,7 +246,7 @@ def get_settings():
     return data
 
 def get_admin_chat_id_standalone():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     row = c.execute("SELECT value FROM settings WHERE key = 'telegram_admin_chat_id'").fetchone()
     c.close()
     if row and row[0]:
@@ -278,7 +296,7 @@ def send_telegram_simple(text, chat_id=None, reply_markup=None):
         pass
 
 def build_pending_counter_text():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     pending_dep = c.execute("SELECT COUNT(*) FROM deposits WHERE status = 'pending'").fetchone()[0]
     pending_wd = c.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'").fetchone()[0]
     open_tickets = c.execute("SELECT COUNT(*) FROM support_tickets WHERE status = 'open'").fetchone()[0]
@@ -291,7 +309,7 @@ def build_pending_counter_text():
     )
 
 def build_admin_stats_text():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     total_members = c.execute("SELECT COUNT(*) FROM users WHERE role = 'user'").fetchone()[0]
     total_depositors = c.execute("""
         SELECT COUNT(DISTINCT d.user_id)
@@ -314,7 +332,7 @@ def build_admin_stats_text():
     )
 
 def build_daily_summary_text():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     new_users = c.execute(
         "SELECT COUNT(*) FROM users WHERE role = 'user' AND date(created_at) = ?",
@@ -370,7 +388,7 @@ def build_user_action_markup(rows_list, limit_rows=6):
     return {"inline_keyboard": inline_rows} if inline_rows else None
 
 def build_all_users_messages():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     rows = c.execute("""
         SELECT id, full_name, email, phone_number, balance, total_deposit, total_income,
@@ -395,7 +413,7 @@ def search_users_response(query_str):
     q = (query_str or "").strip()
     if not q:
         return "🔍 Type user ID, name, email, or phone number to search.", None
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     if q.isdigit():
         rows = c.execute("""
@@ -419,7 +437,7 @@ def search_users_response(query_str):
 
 def set_user_account_status(user_id, target_status):
     new_status = "suspended" if target_status == "suspend" else "active"
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     u = c.execute("SELECT id, full_name, COALESCE(account_status, 'active') AS status FROM users WHERE id = ? AND role = 'user'", (user_id,)).fetchone()
     if not u:
@@ -433,7 +451,7 @@ def set_user_account_status(user_id, target_status):
     return f"✅ User #{user_id} ({u['full_name']}) is now UNSUSPENDED (ACTIVE)."
 
 def delete_user_completely(user_id):
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     u = c.execute("SELECT id, full_name, email FROM users WHERE id = ? AND role = 'user'", (user_id,)).fetchone()
     if not u:
@@ -454,7 +472,7 @@ def send_message_to_user(user_id, text_msg):
     clean_msg = (text_msg or "").strip()
     if not clean_msg:
         return "❌ Message text cannot be empty."
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     u = c.execute("SELECT id, full_name, email FROM users WHERE id = ? AND role = 'user'", (user_id,)).fetchone()
     if not u:
@@ -469,7 +487,7 @@ def broadcast_message_to_all_users(text_msg):
     clean_msg = (text_msg or "").strip()
     if not clean_msg:
         return "❌ Broadcast message cannot be empty."
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     users = c.execute("SELECT id FROM users WHERE role = 'user'").fetchall()
     for r in users:
         add_user_notification(c, r[0], f"Announcement: {clean_msg}", "success")
@@ -478,7 +496,7 @@ def broadcast_message_to_all_users(text_msg):
     return f"📢 Broadcast delivered to {len(users)} users."
 
 def adjust_user_balance(user_id, delta_amount):
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     u = c.execute("SELECT id, full_name, balance, total_income FROM users WHERE id = ? AND role = 'user'", (user_id,)).fetchone()
     if not u:
@@ -494,7 +512,7 @@ def adjust_user_balance(user_id, delta_amount):
     return f"💰 User #{user_id} ({u['full_name']}) {action_label}. New Balance: ₦{new_bal:,.2f}"
 
 def build_open_tickets_text():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     rows = c.execute("""
         SELECT t.id, t.subject, t.message, t.status, t.created_at, u.full_name, u.email
@@ -515,7 +533,7 @@ def build_open_tickets_text():
     return "\n\n".join(blocks)
 
 def close_support_ticket(ticket_id):
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     t = c.execute("SELECT id, user_id, subject, status FROM support_tickets WHERE id = ?", (ticket_id,)).fetchone()
     if not t:
@@ -528,7 +546,7 @@ def close_support_ticket(ticket_id):
     return f"✅ Ticket #{ticket_id} closed and user notified."
 
 def build_bot_settings_text():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     rows = c.execute("SELECT key, value FROM settings").fetchall()
     c.close()
     s = {k: v for k, v in rows}
@@ -556,14 +574,14 @@ def update_single_setting(key_name, new_val):
     v = (new_val or "").strip()
     if k not in allowed or not v:
         return f"❌ Invalid setting key '{k}' or empty value."
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, v))
     c.commit()
     c.close()
     return f"✅ Updated setting '{k}' = '{v}'."
 
 def toggle_maintenance_mode():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     row = c.execute("SELECT value FROM settings WHERE key = 'maintenance_mode'").fetchone()
     current = row[0] if row else "0"
     new_val = "0" if current == "1" else "1"
@@ -613,7 +631,7 @@ def send_admin_panel(chat_id):
     send_telegram_simple(text, chat_id, reply_markup=keyboard)
 
 def send_pending_list(chat_id, kind):
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     if kind == "deposit":
         rows = c.execute("""
@@ -1218,7 +1236,7 @@ def submit_withdraw():
     return redirect(url_for("dashboard", tab="wallet"))
 
 def apply_admin_decision(record_type, record_id, action, reason=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     result_text = "Already processed."
@@ -1290,7 +1308,7 @@ def poll_telegram_bot():
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": False},
+            json={"drop_pending_updates": True},
             timeout=8
         )
     except Exception:
@@ -1314,7 +1332,7 @@ def poll_telegram_bot():
 
                         if txt in ("/start", "/admin"):
                             pending_prompts.pop(chat_id, None)
-                            c = sqlite3.connect(DB_PATH)
+                            c = sqlite3.connect(DB_PATH, timeout=15)
                             c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('telegram_admin_chat_id', ?)", (str(chat_id),))
                             c.commit()
                             c.close()
@@ -1660,36 +1678,33 @@ def admin_update_settings():
     db.commit()
     return redirect(url_for("admin_dashboard"))
 
-_poller_lock_fh = None
+_poller_sock = None
 
-def _release_poller_lock():
-    global _poller_lock_fh
-    if _poller_lock_fh:
+def _release_poller_sock():
+    global _poller_sock
+    if _poller_sock is not None:
         try:
-            if os.name != "nt":
-                import fcntl
-                fcntl.flock(_poller_lock_fh.fileno(), fcntl.LOCK_UN)
-            _poller_lock_fh.close()
+            _poller_sock.close()
         except Exception:
             pass
-        _poller_lock_fh = None
+        _poller_sock = None
 
 def start_single_telegram_poller():
-    global _poller_lock_fh
-    if not TELEGRAM_BOT_TOKEN or _poller_lock_fh is not None:
+    global _poller_sock
+    if not TELEGRAM_BOT_TOKEN or _poller_sock is not None:
         return
     if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         return
-    fh = open(POLLER_LOCK_FILE, "a+")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        if os.name != "nt":
-            import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _poller_lock_fh = fh
-        atexit.register(_release_poller_lock)
+        sock.bind(("127.0.0.1", 49152))
+        sock.listen(1)
+        _poller_sock = sock
+        atexit.register(_release_poller_sock)
         threading.Thread(target=poll_telegram_bot, daemon=True).start()
     except OSError:
-        fh.close()
+        sock.close()
 
 start_single_telegram_poller()
 
