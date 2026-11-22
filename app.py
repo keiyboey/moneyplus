@@ -222,16 +222,23 @@ def init_db():
     admin_exists = db.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
     admin_pass = os.environ.get("ADMIN_PASSWORD", "").strip()
     admin_raw = (os.environ.get("ADMIN_EMAIL") or os.environ.get("ADMIN_PHONE") or "").strip()
-    if not admin_exists and admin_raw and admin_pass:
+    if admin_raw and admin_pass:
         kind, val = normalize_identifier(admin_raw)
         adm_email = val if kind == "email" else f"admin_{val.lstrip('+')}@noemail.local"
         adm_phone = "" if kind == "email" else val
-        db.execute(
-            """INSERT OR IGNORE INTO users
-               (full_name, email, phone_number, password_hash, role, account_status)
-               VALUES ('System Admin', ?, ?, ?, 'admin', 'active')""",
-            (adm_email, adm_phone, generate_password_hash(admin_pass))
-        )
+        pw_hash = generate_password_hash(admin_pass)
+        if admin_exists:
+            db.execute(
+                "UPDATE users SET email = ?, phone_number = ?, password_hash = ?, account_status = 'active' WHERE id = ?",
+                (adm_email, adm_phone, pw_hash, admin_exists["id"])
+            )
+        else:
+            db.execute(
+                """INSERT OR IGNORE INTO users
+                   (full_name, email, phone_number, password_hash, role, account_status)
+                   VALUES ('System Admin', ?, ?, ?, 'admin', 'active')""",
+                (adm_email, adm_phone, pw_hash)
+            )
 
     db.commit()
     db.close()
