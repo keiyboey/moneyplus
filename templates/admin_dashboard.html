@@ -216,6 +216,7 @@ td{border-bottom:1px solid rgba(255,255,255,.05);padding:7px;vertical-align:top}
       <label><span>Account Name</span><input name="account_name" value="{{ settings.account_name }}" required></label>
       <label><span>Customer Care Link</span><input name="service_link" value="{{ settings.service_link }}" required></label>
       <label><span>Telegram Admin Chat ID</span><input name="telegram_admin_chat_id" value="{{ settings.telegram_admin_chat_id }}" placeholder="Send /start to bot"></label>
+      <label><span>Telegram Bot Token</span><input name="telegram_bot_token" value="{{ settings.telegram_bot_token or '' }}" placeholder="123456:ABC-DEF..."></label>
       <label><span>Group Link</span><input name="group_link" value="{{ settings.group_link }}" required></label>
       <div style="grid-column:1/-1">
         <button type="submit" class="btn-save">Save Settings</button>

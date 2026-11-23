@@ -287,13 +287,26 @@ def send_telegram_request(text, kind, record_id, chat_id=None):
         pass
 
 _recent_tg_msgs = {}
+
+def get_active_bot_token():
+    try:
+        c = sqlite3.connect(DB_PATH, timeout=10)
+        row = c.execute("SELECT value FROM settings WHERE key = 'telegram_bot_token'").fetchone()
+        c.close()
+        if row and row[0] and str(row[0]).strip():
+            return str(row[0]).strip()
+    except Exception:
+        pass
+    return TELEGRAM_BOT_TOKEN
+_recent_tg_msgs = {}
 def send_telegram_simple(text, chat_id=None, reply_markup=None):
     target_chat = chat_id or get_admin_chat_id_standalone()
-    if not TELEGRAM_BOT_TOKEN or not target_chat:
+    bot_tok = get_active_bot_token()
+    if not bot_tok or not target_chat:
         return
     key = (str(target_chat), str(text))
     now = time.time()
-    if now - _recent_tg_msgs.get(key, 0) < 2.0:
+    if now - _recent_tg_msgs.get(key, 0) < 15.0:
         return
     _recent_tg_msgs[key] = now
     payload = {"chat_id": target_chat, "text": text}
@@ -301,7 +314,7 @@ def send_telegram_simple(text, chat_id=None, reply_markup=None):
         payload["reply_markup"] = reply_markup
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{bot_tok}/sendMessage",
             json=payload,
             timeout=8
         )
@@ -1692,7 +1705,7 @@ def admin_withdraw_action(withdraw_id, action):
 @admin_required
 def admin_update_settings():
     db = get_db()
-    for k in ["bank_name", "account_number", "account_name", "service_link", "group_link", "min_deposit", "min_withdrawal", "max_withdrawal", "daily_check_in", "maintenance_mode", "telegram_admin_chat_id"]:
+    for k in ["bank_name", "account_number", "account_name", "service_link", "group_link", "min_deposit", "min_withdrawal", "max_withdrawal", "daily_check_in", "maintenance_mode", "telegram_admin_chat_id", "telegram_bot_token"]:
         val = request.form.get(k, "").strip()
         if val != "":
             db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, val))
