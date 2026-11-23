@@ -270,7 +270,7 @@ def send_telegram_request(text, kind, record_id, chat_id=None):
     target_chat = chat_id or get_admin_chat_id_standalone()
     if not TELEGRAM_BOT_TOKEN or not target_chat:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{get_active_bot_token()}/sendMessage"
     payload = {
         "chat_id": target_chat,
         "text": text,
@@ -288,6 +288,9 @@ def send_telegram_request(text, kind, record_id, chat_id=None):
 
 _recent_tg_msgs = {}
 
+_CURRENT_POLLER_TOKEN = None
+_POLLER_STOP_EVENT = threading.Event()
+
 def get_active_bot_token():
     try:
         c = sqlite3.connect(DB_PATH, timeout=10)
@@ -298,6 +301,25 @@ def get_active_bot_token():
     except Exception:
         pass
     return TELEGRAM_BOT_TOKEN
+
+def ensure_poller_for_current_token():
+    global _CURRENT_POLLER_TOKEN, _POLLER_STOP_EVENT, _poller_sock
+    tok = get_active_bot_token()
+    if not tok:
+        return
+    if _CURRENT_POLLER_TOKEN == tok and _poller_sock is not None:
+        return
+    _POLLER_STOP_EVENT.set()
+    try:
+        if _poller_sock is not None:
+            _poller_sock.close()
+            _poller_sock = None
+    except Exception:
+        pass
+    _POLLER_STOP_EVENT = threading.Event()
+    _CURRENT_POLLER_TOKEN = tok
+    threading.Thread(target=poll_telegram_bot, args=(tok, _POLLER_STOP_EVENT), daemon=True).start()
+
 _recent_tg_msgs = {}
 def send_telegram_simple(text, chat_id=None, reply_markup=None):
     target_chat = chat_id or get_admin_chat_id_standalone()
@@ -1322,9 +1344,11 @@ def apply_admin_decision(record_type, record_id, action, reason=None):
     conn.close()
     return result_text
 
-def poll_telegram_bot():
-    if not TELEGRAM_BOT_TOKEN:
+def poll_telegram_bot(token=None, stop_event=None):
+    bot_tok = token or get_active_bot_token()
+    if not bot_tok:
         return
+    stop_ev = stop_event or threading.Event()
     seen_updates = set()
     try:
         with open(POLLER_PID_FILE, "w", encoding="utf-8") as f:
@@ -1334,7 +1358,7 @@ def poll_telegram_bot():
 
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            f"https://api.telegram.org/bot{bot_tok}/deleteWebhook",
             json={"drop_pending_updates": True},
             timeout=8
         )
@@ -1343,12 +1367,13 @@ def poll_telegram_bot():
 
     offset = None
     pending_prompts = {}
-    while True:
+    while not stop_ev.is_set():
+        bot_tok = get_active_bot_token() or bot_tok
         try:
             params = {"timeout": 25}
             if offset is not None:
                 params["offset"] = offset
-            resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params=params, timeout=30).json()
+            resp = requests.get(f"https://api.telegram.org/bot{bot_tok}/getUpdates", params=params, timeout=30).json()
             if resp.get("ok"):
                 for upd in resp.get("result", []):
                     uid_upd = upd.get("update_id")
@@ -1541,12 +1566,12 @@ def poll_telegram_bot():
                             rec_id = int(parts[2])
                             summary = apply_admin_decision(kind, rec_id, action)
                             requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                 json={"callback_query_id": cb["id"], "text": summary},
                                 timeout=8
                             )
                             requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                                f"https://api.telegram.org/bot{bot_tok}/editMessageText",
                                 json={
                                     "chat_id": chat_id,
                                     "message_id": message_id,
@@ -1560,7 +1585,7 @@ def poll_telegram_bot():
                             if sub_cmd == "msg":
                                 pending_prompts[chat_id] = ("direct_msg", uid)
                                 requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                     json={"callback_query_id": cb["id"], "text": f"Type message for Account #{uid}"},
                                     timeout=8
                                 )
@@ -1568,7 +1593,7 @@ def poll_telegram_bot():
                             elif sub_cmd == "bal":
                                 pending_prompts[chat_id] = ("direct_bal", uid)
                                 requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                     json={"callback_query_id": cb["id"], "text": f"Type balance change for Account #{uid}"},
                                     timeout=8
                                 )
@@ -1578,7 +1603,7 @@ def poll_telegram_bot():
                             uid = int(parts[2])
                             summary = set_user_account_status(uid, st_action)
                             requests.post(
-                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                 json={"callback_query_id": cb["id"], "text": summary},
                                 timeout=8
                             )
@@ -1588,7 +1613,7 @@ def poll_telegram_bot():
                             uid = int(parts[2])
                             if sub_op == "ask":
                                 requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                     json={"callback_query_id": cb["id"], "text": f"Confirm deleting User #{uid}"},
                                     timeout=8
                                 )
@@ -1603,14 +1628,14 @@ def poll_telegram_bot():
                             elif sub_op == "confirm":
                                 summary = delete_user_completely(uid)
                                 requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                     json={"callback_query_id": cb["id"], "text": summary},
                                     timeout=8
                                 )
                                 send_telegram_simple(summary, chat_id)
                             else:
                                 requests.post(
-                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    f"https://api.telegram.org/bot{bot_tok}/answerCallbackQuery",
                                     json={"callback_query_id": cb["id"], "text": "Deletion cancelled"},
                                     timeout=8
                                 )
@@ -1724,21 +1749,9 @@ def _release_poller_sock():
         _poller_sock = None
 
 def start_single_telegram_poller():
-    global _poller_sock
-    if not TELEGRAM_BOT_TOKEN or _poller_sock is not None:
-        return
     if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         return
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("127.0.0.1", 49152))
-        sock.listen(1)
-        _poller_sock = sock
-        atexit.register(_release_poller_sock)
-        threading.Thread(target=poll_telegram_bot, daemon=True).start()
-    except OSError:
-        sock.close()
+    ensure_poller_for_current_token()
 
 start_single_telegram_poller()
 
